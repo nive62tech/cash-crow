@@ -16,3 +16,26 @@ Thumbs.db
 
 # Editor
 .vscode/
+
+# Dataset images (raw + split) -- regenerate via split_dataset.py, don't commit
+data/
+
+# Trained model checkpoints -- large binary, don't commit
+models/
+
+# MediaPipe hand model (auto-downloaded by detect.py at runtime)
+*.task
+
+# Debug crop images from classifier.py testing
+debug_crops/
+# Dataset images (raw + split) -- regenerate via split_dataset.py, don't commit
+data/
+
+# Trained model checkpoints -- large binary, don't commit
+models/
+
+# MediaPipe hand model (auto-downloaded by detect.py at runtime)
+*.task
+
+# Debug crop images from classifier.py testing
+debug_crops/
