@@ -1,0 +1,18 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# YOLO downloaded weights (re-downloaded automatically, no need to commit)
+*.pt
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/

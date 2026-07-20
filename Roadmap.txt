@@ -1,0 +1,52 @@
+Phase-wise Roadmap
+Phase 1 — Monday MVP (today → Monday evening)
+Goal: working webcam demo, no custom training yet.
+
+Set up a Python virtual environment in VS Code, install ultralytics (YOLOv8), opencv-python.
+Load YOLOv8n with pre-trained COCO weights (no training needed yet — used just to prove the pipeline).
+Write a script to run detection on the laptop webcam feed in real time.
+Add the bounding-box distance heuristic: score each detected box by size + vertical position, mark the "closest" one as the likely waste item, ignore the rest as background.
+Push this to the already-created GitHub repo with a clean structure.
+
+Suggested repo structure:
+smart-bin/
+├── src/
+│   ├── detect.py        # webcam + YOLO inference
+│   ├── roi_selector.py   # bounding box distance heuristic
+│   └── utils.py
+├── data/                 # datasets go here later
+├── models/                # weights go here later
+├── requirements.txt
+└── README.md
+Phase 2 — Dataset Collection & Labeling (this week)
+
+Download TACO and TrashNet as a starting base.
+Convert TACO's COCO-format annotations to YOLO .txt format.
+Remap all categories into just 3 classes: Plastic, Paper, Other (food waste, glass, metal, etc. all fold into "Other").
+Start capturing your own images — ideally with the Pi Camera 3 if available, otherwise webcam for now, mimicking the real mounting angle/height.
+Label your own images using Roboflow or LabelImg, using only the 3 classes.
+Merge public + custom data into one training set.
+
+Phase 3 — Model Fine-tuning
+
+Fine-tune YOLOv8n on the merged waste dataset — 3 classes (Plastic, Paper, Other).
+Fine-tune MobileNetV3-Small as the classifier on cropped ROIs — same 3 classes.
+Evaluate accuracy on a held-out validation set; iterate if needed.
+
+Phase 4 — Raspberry Pi Deployment
+
+Export both models to TensorFlow Lite/NCNN with INT8 quantization.
+Set up Pi Camera 3 + Pi 4, test inference speed and latency on-device.
+Integrate the ultrasonic/IR sensor trigger (Approach D).
+
+Phase 5 — Full Pipeline Integration
+
+Wire up detection → crop → classification → decision logic.
+Connect to servo/actuator to open one of the 3 lids (Plastic / Paper / Other).
+Add MQTT logging to the dashboard.
+
+Phase 6 — Testing & Refinement
+
+Test outdoors/semi-outdoors for lighting/noise robustness.
+Tune confidence thresholds and the distance heuristic with real data.
+Bug fixes, performance tuning for Pi 4 (and Pi 5 if upgraded).
