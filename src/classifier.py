@@ -22,6 +22,8 @@ import numpy as np
 MODEL_PATH = Path("models/mobilenetv3_waste.pth")
 IMAGE_SIZE = 224
 CONFIDENCE_THRESHOLD = 0.6   # tweak this later based on live testing
+DEBUG_SAVE_CROPS = True      # saves every crop fed to the model, for inspection
+DEBUG_DIR = Path("debug_crops")
 # --------------------------------------------------------------------------
 
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,6 +68,8 @@ def _load_checkpoint():
 _model, _class_names = _load_checkpoint()
 print(f"[classifier.py] Loaded model. Classes: {_class_names}")
 
+_debug_counter = 0
+
 
 def predict(cropped_image):
     """
@@ -81,12 +85,19 @@ def predict(cropped_image):
         label is one of _class_names, or "Uncertain" if confidence is
         below CONFIDENCE_THRESHOLD.
     """
+    global _debug_counter
+
     # Convert OpenCV BGR numpy array -> PIL RGB image
     if isinstance(cropped_image, np.ndarray):
         rgb = cropped_image[:, :, ::-1]  # BGR -> RGB
         pil_image = Image.fromarray(rgb)
     else:
         pil_image = cropped_image
+
+    if DEBUG_SAVE_CROPS:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        _debug_counter += 1
+        pil_image.save(DEBUG_DIR / f"crop_{_debug_counter:04d}.jpg")
 
     tensor = _preprocess(pil_image).unsqueeze(0).to(_device)  # add batch dim
 
@@ -97,6 +108,11 @@ def predict(cropped_image):
 
     confidence = confidence.item()
     label = _class_names[predicted_idx.item()]
+
+    # Full breakdown -- shows whether the model is confidently wrong or
+    # genuinely torn between classes.
+    prob_str = ", ".join(f"{name}={p.item():.2f}" for name, p in zip(_class_names, probs))
+    print(f"[classifier] {prob_str} -> raw_pred={label} ({confidence:.2f})")
 
     if confidence < CONFIDENCE_THRESHOLD:
         return "Uncertain", confidence
