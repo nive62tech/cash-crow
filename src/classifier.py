@@ -46,9 +46,8 @@ CLASS_MAP = {
 # Load class index -> name mapping from his classes.json
 with open(CLASSES_PATH, "r") as f:
     _raw_classes = json.load(f)
-    # classes.json is expected to map index -> name, e.g. {"0": "plastic", ...}
-    # sorted by index so position 0 = index 0, etc.
-    _class_names_raw = [_raw_classes[str(i)] for i in range(len(_raw_classes))]
+    _idx_to_class = _raw_classes["idx_to_class"]
+    _class_names_raw = [_idx_to_class[str(i)] for i in range(len(_idx_to_class))]
 
 _interpreter = Interpreter(model_path=str(MODEL_PATH))
 _interpreter.allocate_tensors()
