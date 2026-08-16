@@ -1,23 +1,33 @@
 """
-train_classifier.py
+train_classifier.py (v2 -- addresses Plastic/Paper/Other confusion)
 
-Fine-tunes MobileNetV3-Small (pre-trained on ImageNet) to classify
-cropped waste images into your 3 classes: Plastic, Paper, Other.
+Fine-tunes MobileNetV3-Small to classify cropped waste images into
+Plastic, Paper, Other.
 
-WHY MOBILENETV3-SMALL, AND WHY THIS IS DIFFERENT FROM detect.py:
-    detect.py (YOLOv8n) answers "where is an object in this frame".
-    This script trains a SEPARATE, second model that answers "given
-    just a cropped picture of one object, what material is it". In the
-    final pipeline: YOLO finds the box -> the box is cropped out of the
-    frame -> that crop is fed into THIS trained model -> it outputs
-    Plastic/Paper/Other. MobileNetV3-Small is used here specifically
-    because it's small/fast enough to run on a Raspberry Pi on just the
-    small cropped region, without needing to re-run over the whole frame.
+WHAT CHANGED FROM v1 AND WHY:
+    1. CLASS-WEIGHTED LOSS: the original training treated every image
+       equally, but "Other" had 1,355 images vs Plastic's 921 and
+       Paper's 961. This biases the model toward predicting the
+       majority class whenever it's unsure -- exactly the symptom
+       observed live (real Plastic items reading as Other/Paper).
+       Weighting the loss makes mistakes on minority classes "cost"
+       more during training, forcing the model to actually learn to
+       distinguish them instead of defaulting to the safe majority
+       guess.
+    2. MORE EPOCHS (25 instead of 15): more passes over the data gives
+       the model more chances to refine the harder Plastic/Paper
+       boundary, since that boundary was clearly still weak at 15
+       epochs (92.3% val accuracy overall was masking a much weaker
+       per-class result on Plastic specifically).
+    3. STRONGER AUGMENTATION: added random crop/zoom, since your real
+       webcam crops are less tightly-framed than the clean Kaggle
+       training photos. This is a cheap way to make the model more
+       tolerant of imperfect real-world framing without needing new
+       data.
 
 BEFORE RUNNING THIS:
-    Run split_dataset.py first -- this script expects data already
-    organized into data/classification/train/<class>/ and
-    data/classification/val/<class>/, which that script creates for you.
+    Same as before -- data/classification/train and val must already
+    exist (they do, from your first run of split_dataset.py).
 
 Run:
     python train_classifier.py
@@ -35,33 +45,36 @@ from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 # --- Config -------------------------------------------------------------
 DATA_DIR = Path("../data/classification")
 MODEL_OUT_DIR = Path("../models")
-MODEL_OUT_PATH = MODEL_OUT_DIR / "mobilenetv3_waste.pth"
+MODEL_OUT_PATH = MODEL_OUT_DIR / "mobilenetv3_waste_v2.pth"  # new filename --
+                                                                # keeps your
+                                                                # original
+                                                                # checkpoint
+                                                                # safe as a
+                                                                # fallback
 
-IMAGE_SIZE = 224           # MobileNetV3's expected input size
-BATCH_SIZE = 8             # lowered from 16 -- you hit an out-of-memory
-                            # crash on CPU; lower this further (e.g. 4) if
-                            # it still happens
-NUM_EPOCHS = 15
+IMAGE_SIZE = 224
+BATCH_SIZE = 8
+NUM_EPOCHS = 25           # was 15
 LEARNING_RATE = 0.001
-NUM_CLASSES = 3            # Plastic, Paper, Other
+NUM_CLASSES = 3
 # --------------------------------------------------------------------------
 
 
 def build_dataloaders():
-    # Training gets light augmentation (flips/rotation/color jitter) so the
-    # model doesn't just memorize your exact photos -- real trash won't
-    # always appear at the same angle/lighting as your training images.
     train_transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.7, 1.0)),  # was
+            # a plain Resize -- RandomResizedCrop simulates the loose,
+            # off-center framing real webcam crops have, so the model
+            # sees more realistic variation during training
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),  # widened
+            # from 0.2 -- real lighting varies more than the clean
+            # Kaggle photos did
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # Validation should NOT be augmented -- we want to measure real
-    # performance, not performance on artificially altered images.
     val_transform = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
@@ -77,15 +90,32 @@ def build_dataloaders():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    return train_loader, val_loader, train_dataset.classes
+    return train_loader, val_loader, train_dataset.classes, train_dataset
+
+
+def compute_class_weights(train_dataset, device):
+    """
+    Computes inverse-frequency weights so the loss penalizes mistakes
+    on under-represented classes more heavily. This directly targets
+    the "everything defaults to Other" bias, since Other had ~40% more
+    training images than Plastic or Paper.
+    """
+    from collections import Counter
+    counts = Counter(train_dataset.targets)
+    total = sum(counts.values())
+    num_classes = len(counts)
+
+    weights = []
+    for class_idx in range(num_classes):
+        class_count = counts[class_idx]
+        weight = total / (num_classes * class_count)
+        weights.append(weight)
+
+    print(f"Class weights (by index, matches train_dataset.classes order): {weights}")
+    return torch.tensor(weights, dtype=torch.float32).to(device)
 
 
 def build_model(num_classes, device):
-    # Load MobileNetV3-Small pretrained on ImageNet (1000 classes), then
-    # replace its final classification layer with one sized for OUR
-    # 3 classes. This is standard transfer learning: reuse the general
-    # visual features the model already learned, only retrain the final
-    # decision layer for our specific task.
     weights = MobileNet_V3_Small_Weights.DEFAULT
     model = mobilenet_v3_small(weights=weights)
 
@@ -131,10 +161,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_loader, val_loader, class_names = build_dataloaders()
+    train_loader, val_loader, class_names, train_dataset = build_dataloaders()
     model = build_model(NUM_CLASSES, device)
 
-    criterion = nn.CrossEntropyLoss()
+    class_weights = compute_class_weights(train_dataset, device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)  # was unweighted
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     MODEL_OUT_DIR.mkdir(parents=True, exist_ok=True)

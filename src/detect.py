@@ -58,7 +58,7 @@ from classifier import predict
 
 # --- Config ---------------------------------------------------------------
 MODEL_WEIGHTS = "yolov8n.pt"
-CONFIDENCE_THRESHOLD = 0.4
+CONFIDENCE_THRESHOLD = 0.25
 WEBCAM_INDEX = 0
 DEBUG_PRINT_ALL_RAW = True
 DEBUG_PRINT_STATE = True
@@ -86,7 +86,7 @@ PERSON_ABSENCE_RESET_SECONDS = 4.0
 
 # How many recent frame-level predictions to hold onto for majority-vote
 # smoothing, so a single flickery frame can't flip the displayed label.
-PREDICTION_HISTORY_SIZE = 5
+PREDICTION_HISTORY_SIZE = 2
 
 # Colors are OpenCV BGR, not RGB.
 PERSON_COLOR = (144, 238, 144)     # light green

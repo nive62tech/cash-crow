@@ -1,60 +1,72 @@
 """
 classifier.py
 
-Loads teammate's EfficientNet-B0 FP32 TFLite waste classifier and
-exposes the same predict(cropped_image) interface as before, so
-detect.py does not need to change.
+Loads the trained MobileNetV3-Small waste classifier once at import/
+startup time, and exposes a simple predict(cropped_image) function.
 
-His model outputs 5 classes: plastic, paper, metal, organic_waste, none.
-We map these down to our 3 bin compartments:
-    plastic        -> Plastic
-    paper          -> Paper
-    metal          -> Other
-    organic_waste  -> Other
-    none           -> Uncertain (no recognizable object in the crop)
+This mirrors the exact architecture and preprocessing used in
+train_classifier.py, so predictions here match what was measured
+during training/validation.
 """
 
-import json
 from pathlib import Path
 
-import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from torchvision.models import mobilenet_v3_small
 from PIL import Image
+import numpy as np
 
-try:
-    from tflite_runtime.interpreter import Interpreter
-except ImportError:
-    from tensorflow.lite.python.interpreter import Interpreter
-
-# --- Config ----------------------------------------------------------------
-MODEL_PATH = Path("models/waste_classifier_fp32.tflite")
-CLASSES_PATH = Path("models/classes.json")
+# --- Config (must match train_classifier.py) -----------------------------
+MODEL_PATH = Path("models/mobilenetv3_waste.pth")
 IMAGE_SIZE = 224
-CONFIDENCE_THRESHOLD = 0.6
-DEBUG_SAVE_CROPS = True
+CONFIDENCE_THRESHOLD = 0.45   # tweak this later based on live testing
+DEBUG_SAVE_CROPS = True      # saves every crop fed to the model, for inspection
 DEBUG_DIR = Path("debug_crops")
+# --------------------------------------------------------------------------
 
-# Maps his 5 raw classes -> our 3 bin labels.
-CLASS_MAP = {
-    "plastic": "Plastic",
-    "paper": "Paper",
-    "metal": "Other",
-    "organic_waste": "Other",
-    "none": "Uncertain",
-}
-# -----------------------------------------------------------------------------
+_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load class index -> name mapping from his classes.json
-with open(CLASSES_PATH, "r") as f:
-    _raw_classes = json.load(f)
-    _idx_to_class = _raw_classes["idx_to_class"]
-    _class_names_raw = [_idx_to_class[str(i)] for i in range(len(_idx_to_class))]
+# Same preprocessing as val_transform in train_classifier.py
+_preprocess = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
 
-_interpreter = Interpreter(model_path=str(MODEL_PATH))
-_interpreter.allocate_tensors()
-_input_details = _interpreter.get_input_details()
-_output_details = _interpreter.get_output_details()
 
-print(f"[classifier.py] Loaded EfficientNet-B0 TFLite model. Raw classes: {_class_names_raw}")
+def _build_model(num_classes):
+    # Same architecture as build_model() in train_classifier.py, but we
+    # don't need ImageNet pretrained weights here -- we're about to
+    # overwrite everything with our own trained checkpoint anyway.
+    model = mobilenet_v3_small(weights=None)
+    in_features = model.classifier[-1].in_features
+    model.classifier[-1] = nn.Linear(in_features, num_classes)
+    return model
+
+
+def _load_checkpoint():
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found at {MODEL_PATH.resolve()}. "
+            f"Make sure you're running from the project root."
+        )
+
+    checkpoint = torch.load(MODEL_PATH, map_location=_device)
+    class_names = checkpoint["class_names"]
+
+    model = _build_model(num_classes=len(class_names))
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(_device)
+    model.eval()  # inference mode: disables dropout etc.
+
+    return model, class_names
+
+
+# Loaded once at import time, not on every predict() call.
+_model, _class_names = _load_checkpoint()
+print(f"[classifier.py] Loaded model. Classes: {_class_names}")
 
 _debug_counter = 0
 
@@ -62,11 +74,16 @@ _debug_counter = 0
 def predict(cropped_image):
     """
     Args:
-        cropped_image: NumPy array in BGR (OpenCV) or PIL.Image in RGB.
+        cropped_image: a cropped region of the frame containing the held
+            object. Accepts either:
+              - a NumPy array in BGR format (as OpenCV gives you from
+                frame[y1:y2, x1:x2]), or
+              - a PIL.Image in RGB.
 
     Returns:
         (label: str, confidence: float)
-        label is one of "Plastic", "Paper", "Other", or "Uncertain".
+        label is one of _class_names, or "Uncertain" if confidence is
+        below CONFIDENCE_THRESHOLD.
     """
     global _debug_counter
 
@@ -81,26 +98,20 @@ def predict(cropped_image):
         _debug_counter += 1
         pil_image.save(DEBUG_DIR / f"crop_{_debug_counter:04d}.jpg")
 
-    resized = pil_image.resize((IMAGE_SIZE, IMAGE_SIZE))
-    arr = np.array(resized).astype(np.float32)  # 0-255 range, EfficientNet's
-                                                   # built-in Rescaling layer
-                                                   # handles normalization
-    arr = np.expand_dims(arr, axis=0)  # add batch dim -> (1, 224, 224, 3)
+    tensor = _preprocess(pil_image).unsqueeze(0).to(_device)
 
-    _interpreter.set_tensor(_input_details[0]["index"], arr)
-    _interpreter.invoke()
-    output = _interpreter.get_tensor(_output_details[0]["index"])[0]
+    with torch.no_grad():
+        outputs = _model(tensor)
+        probs = torch.softmax(outputs, dim=1)[0]
+        confidence, predicted_idx = torch.max(probs, dim=0)
 
-    predicted_idx = int(np.argmax(output))
-    confidence = float(output[predicted_idx])
-    raw_label = _class_names_raw[predicted_idx]
+    confidence = confidence.item()
+    label = _class_names[predicted_idx.item()]
 
-    prob_str = ", ".join(f"{name}={p:.2f}" for name, p in zip(_class_names_raw, output))
-    print(f"[classifier] {prob_str} -> raw_pred={raw_label} ({confidence:.2f})")
-
-    mapped_label = CLASS_MAP.get(raw_label, "Uncertain")
+    prob_str = ", ".join(f"{name}={p.item():.2f}" for name, p in zip(_class_names, probs))
+    print(f"[classifier] {prob_str} -> raw_pred={label} ({confidence:.2f})")
 
     if confidence < CONFIDENCE_THRESHOLD:
         return "Uncertain", confidence
 
-    return mapped_label, confidence
+    return label, confidence
