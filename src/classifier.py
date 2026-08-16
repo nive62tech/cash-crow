@@ -19,9 +19,9 @@ from PIL import Image
 import numpy as np
 
 # --- Config (must match train_classifier.py) -----------------------------
-MODEL_PATH = Path("models/mobilenetv3_waste.pth")
+MODEL_PATH = Path("models/mobilenetv3_waste_v2.pth")
 IMAGE_SIZE = 224
-CONFIDENCE_THRESHOLD = 0.45   # tweak this later based on live testing
+CONFIDENCE_THRESHOLD = 0.6   # tweak this later based on live testing
 DEBUG_SAVE_CROPS = True      # saves every crop fed to the model, for inspection
 DEBUG_DIR = Path("debug_crops")
 # --------------------------------------------------------------------------
