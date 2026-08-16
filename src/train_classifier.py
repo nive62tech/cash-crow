@@ -43,8 +43,8 @@ from torchvision import datasets, transforms
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 
 # --- Config -------------------------------------------------------------
-DATA_DIR = Path("../data/classification")
-MODEL_OUT_DIR = Path("../models")
+DATA_DIR = Path("data/classification")
+MODEL_OUT_DIR = Path("models")
 MODEL_OUT_PATH = MODEL_OUT_DIR / "mobilenetv3_waste_v2.pth"  # new filename --
                                                                 # keeps your
                                                                 # original
