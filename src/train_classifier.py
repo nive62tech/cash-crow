@@ -1,197 +1,168 @@
 """
-train_classifier.py (v2 -- addresses Plastic/Paper/Other confusion)
+train_classifier.py (v3)
 
-Fine-tunes MobileNetV3-Small to classify cropped waste images into
-Plastic, Paper, Other.
+Trains MobileNetV3-Small on data/classification/{train,val}/<class>/ for
+however many classes exist (auto-detected via ImageFolder -- no hardcoded
+class count, so this works for the 10-class scheme without edits).
 
-WHAT CHANGED FROM v1 AND WHY:
-    1. CLASS-WEIGHTED LOSS: the original training treated every image
-       equally, but "Other" had 1,355 images vs Plastic's 921 and
-       Paper's 961. This biases the model toward predicting the
-       majority class whenever it's unsure -- exactly the symptom
-       observed live (real Plastic items reading as Other/Paper).
-       Weighting the loss makes mistakes on minority classes "cost"
-       more during training, forcing the model to actually learn to
-       distinguish them instead of defaulting to the safe majority
-       guess.
-    2. MORE EPOCHS (25 instead of 15): more passes over the data gives
-       the model more chances to refine the harder Plastic/Paper
-       boundary, since that boundary was clearly still weak at 15
-       epochs (92.3% val accuracy overall was masking a much weaker
-       per-class result on Plastic specifically).
-    3. STRONGER AUGMENTATION: added random crop/zoom, since your real
-       webcam crops are less tightly-framed than the clean Kaggle
-       training photos. This is a cheap way to make the model more
-       tolerant of imperfect real-world framing without needing new
-       data.
+Carries forward from v2:
+  - class-weighted CrossEntropyLoss (inverse frequency) to counter imbalance
+  - RandomResizedCrop(224, scale=(0.7, 1.0)) instead of plain Resize
+  - wider ColorJitter (0.3) for lighting variation
+  - checkpoint saved as {"model_state_dict":..., "class_names": [...]} so
+    classifier.py never has to guess class order
 
-BEFORE RUNNING THIS:
-    Same as before -- data/classification/train and val must already
-    exist (they do, from your first run of split_dataset.py).
-
-Run:
-    python train_classifier.py
+Run from the project root:
+    python src\\train_classifier.py
 """
 
-import time
+import json
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+from torchvision import datasets, transforms, models
 
-# --- Config -------------------------------------------------------------
+# ---- Config -----------------------------------------------------------------
+
 DATA_DIR = Path("data/classification")
-MODEL_OUT_DIR = Path("models")
-MODEL_OUT_PATH = MODEL_OUT_DIR / "mobilenetv3_waste_v2.pth"  # new filename --
-                                                                # keeps your
-                                                                # original
-                                                                # checkpoint
-                                                                # safe as a
-                                                                # fallback
-
-IMAGE_SIZE = 224
+MODEL_OUT = Path("models/mobilenetv3_waste_v3.pth")
 BATCH_SIZE = 8
-NUM_EPOCHS = 25           # was 15
+EPOCHS = 25
 LEARNING_RATE = 0.001
-NUM_CLASSES = 3
-# --------------------------------------------------------------------------
+IMAGE_SIZE = 224
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def build_dataloaders():
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.7, 1.0)),  # was
-            # a plain Resize -- RandomResizedCrop simulates the loose,
-            # off-center framing real webcam crops have, so the model
-            # sees more realistic variation during training
+def build_transforms():
+    train_tf = transforms.Compose([
+        transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.7, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),  # widened
-            # from 0.2 -- real lighting varies more than the clean
-            # Kaggle photos did
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-
-    val_transform = transforms.Compose([
+    # Val transform MUST exactly match what classifier.py uses at inference time.
+    val_tf = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-
-    train_dataset = datasets.ImageFolder(DATA_DIR / "train", transform=train_transform)
-    val_dataset = datasets.ImageFolder(DATA_DIR / "val", transform=val_transform)
-
-    print(f"Classes found (order matters for inference later!): {train_dataset.classes}")
-    print(f"Train images: {len(train_dataset)} | Val images: {len(val_dataset)}")
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-
-    return train_loader, val_loader, train_dataset.classes, train_dataset
+    return train_tf, val_tf
 
 
-def compute_class_weights(train_dataset, device):
-    """
-    Computes inverse-frequency weights so the loss penalizes mistakes
-    on under-represented classes more heavily. This directly targets
-    the "everything defaults to Other" bias, since Other had ~40% more
-    training images than Plastic or Paper.
-    """
-    from collections import Counter
-    counts = Counter(train_dataset.targets)
-    total = sum(counts.values())
-    num_classes = len(counts)
-
-    weights = []
-    for class_idx in range(num_classes):
-        class_count = counts[class_idx]
-        weight = total / (num_classes * class_count)
-        weights.append(weight)
-
-    print(f"Class weights (by index, matches train_dataset.classes order): {weights}")
-    return torch.tensor(weights, dtype=torch.float32).to(device)
-
-
-def build_model(num_classes, device):
-    weights = MobileNet_V3_Small_Weights.DEFAULT
-    model = mobilenet_v3_small(weights=weights)
-
+def build_model(num_classes: int):
+    model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
     in_features = model.classifier[-1].in_features
     model.classifier[-1] = nn.Linear(in_features, num_classes)
+    return model
 
-    return model.to(device)
+
+def compute_class_weights(dataset: datasets.ImageFolder, num_classes: int):
+    counts = [0] * num_classes
+    for _, label in dataset.samples:
+        counts[label] += 1
+
+    total = sum(counts)
+    weights = []
+    for c in counts:
+        if c == 0:
+            # Class has 0 images (shouldn't happen if split_dataset.py warned
+            # you and you fixed it -- but don't divide by zero if it slipped through)
+            weights.append(0.0)
+        else:
+            weights.append(total / (num_classes * c))
+
+    print("Class counts and weights:")
+    for name, count, weight in zip(dataset.classes, counts, weights):
+        print(f"  {name}: {count} images, weight={weight:.3f}")
+
+    return torch.tensor(weights, dtype=torch.float32)
 
 
-def run_epoch(model, loader, criterion, optimizer, device, is_training):
-    model.train() if is_training else model.eval()
+def run_epoch(model, loader, criterion, optimizer=None):
+    is_train = optimizer is not None
+    model.train() if is_train else model.eval()
 
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    context = torch.enable_grad() if is_training else torch.no_grad()
-    with context:
+    total_loss, correct, total = 0.0, 0, 0
+    with torch.set_grad_enabled(is_train):
         for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
 
-            if is_training:
+            if is_train:
                 optimizer.zero_grad()
 
             outputs = model(images)
             loss = criterion(outputs, labels)
 
-            if is_training:
+            if is_train:
                 loss.backward()
                 optimizer.step()
 
             total_loss += loss.item() * images.size(0)
-            _, predicted = outputs.max(1)
-            correct += (predicted == labels).sum().item()
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
             total += labels.size(0)
 
-    avg_loss = total_loss / total
-    accuracy = correct / total
-    return avg_loss, accuracy
+    return total_loss / total, correct / total
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    train_dir = DATA_DIR / "train"
+    val_dir = DATA_DIR / "val"
 
-    train_loader, val_loader, class_names, train_dataset = build_dataloaders()
-    model = build_model(NUM_CLASSES, device)
+    if not train_dir.exists() or not val_dir.exists():
+        print(f"ERROR: {train_dir} or {val_dir} not found. Run split_dataset.py first.")
+        return
 
-    class_weights = compute_class_weights(train_dataset, device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)  # was unweighted
+    train_tf, val_tf = build_transforms()
+    train_dataset = datasets.ImageFolder(train_dir, transform=train_tf)
+    val_dataset = datasets.ImageFolder(val_dir, transform=val_tf)
+
+    class_names = train_dataset.classes  # alphabetical, ImageFolder default
+    num_classes = len(class_names)
+    print(f"Training on {num_classes} classes: {class_names}\n")
+
+    if train_dataset.classes != val_dataset.classes:
+        print("ERROR: train and val class folders don't match. Re-run split_dataset.py.")
+        return
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    model = build_model(num_classes).to(DEVICE)
+
+    class_weights = compute_class_weights(train_dataset, num_classes).to(DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    MODEL_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    best_val_accuracy = 0.0
+    best_val_acc = 0.0
+    MODEL_OUT.parent.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, NUM_EPOCHS + 1):
-        start = time.time()
+    for epoch in range(1, EPOCHS + 1):
+        train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_acc = run_epoch(model, val_loader, criterion, optimizer=None)
 
-        train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, device, is_training=True)
-        val_loss, val_acc = run_epoch(model, val_loader, criterion, optimizer, device, is_training=False)
+        print(f"Epoch {epoch}/{EPOCHS}  "
+              f"train_loss={train_loss:.4f} train_acc={train_acc:.4f}  "
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
 
-        elapsed = time.time() - start
-        print(f"Epoch {epoch}/{NUM_EPOCHS} ({elapsed:.1f}s) - "
-              f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} - "
-              f"val_loss={val_loss:.4f} val_acc={val_acc:.3f}")
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(
+                {"model_state_dict": model.state_dict(), "class_names": class_names},
+                MODEL_OUT,
+            )
+            print(f"  -> new best ({val_acc:.4f}), saved to {MODEL_OUT}")
 
-        if val_acc > best_val_accuracy:
-            best_val_accuracy = val_acc
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "class_names": class_names,
-            }, MODEL_OUT_PATH)
-            print(f"  -> new best val_acc={val_acc:.3f}, saved to {MODEL_OUT_PATH}")
+    print(f"\nDone. Best val accuracy: {best_val_acc:.4f}")
+    print(f"Checkpoint: {MODEL_OUT}")
 
-    print(f"\nTraining done. Best val accuracy: {best_val_accuracy:.3f}")
-    print(f"Best model saved at: {MODEL_OUT_PATH.resolve()}")
+    # Also dump class list to json for quick reference without loading the checkpoint
+    with open(MODEL_OUT.with_suffix(".classes.json"), "w") as f:
+        json.dump(class_names, f, indent=2)
 
 
 if __name__ == "__main__":
