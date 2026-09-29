@@ -35,22 +35,24 @@ from roi_selector import Detection, compute_scores
 from classifier import predict
 
 
-def load_image_exif_safe(path):
+def load_image_exif_safe(path, max_dimension=1600):
     """
     Loads an image respecting EXIF orientation metadata, then returns it as
     a BGR numpy array (OpenCV's expected format).
 
-    cv2.imread() ignores EXIF rotation entirely -- a phone photo taken in
-    portrait mode can get loaded sideways or upside-down even though it
-    displays correctly in any normal photo viewer. That silently breaks
-    both hand detection (a sideways hand doesn't match expected geometry)
-    and YOLO (a rotated real-world scene can produce nonsense detections).
-    This is very likely why so many real, hand-held photos were being
-    skipped or misdetected.
+    Also downscales large images (phone photos are often 3000-4000px+ per
+    side) to a max dimension -- processing hundreds of full-resolution
+    images back-to-back without this was causing memory exhaustion crashes
+    partway through a run. Downscaling doesn't hurt detection accuracy
+    meaningfully here since YOLO/MediaPipe resize internally anyway.
     """
     pil_img = Image.open(path)
     pil_img = ImageOps.exif_transpose(pil_img)  # applies EXIF rotation, if any
     pil_img = pil_img.convert("RGB")
+
+    if max(pil_img.size) > max_dimension:
+        pil_img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+
     rgb_array = np.array(pil_img)
     bgr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
     return bgr_array
